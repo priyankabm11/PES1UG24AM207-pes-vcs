@@ -95,8 +95,96 @@ int object_exists(const ObjectID *id) {
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
     // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
+
+    const char *type_str =
+        (type == OBJ_BLOB) ? "blob" :
+        (type == OBJ_TREE) ? "tree" : "commit";
+
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    if (header_len < 0) return -1;
+    header_len += 1; // include '\0'
+
+    size_t total_len = header_len + len;
+    char *full = malloc(total_len);
+    if (!full) return -1;
+
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    compute_hash(full, total_len, id_out);
+
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    char dir[512];
+    char *slash = strrchr(path, '/');
+    if (!slash) {
+        free(full);
+        return -1;
+    }
+    size_t dlen = slash - path;
+    memcpy(dir, path, dlen);
+    dir[dlen] = '\0';
+
+    mkdir(dir, 0755);
+
+    char temp_path[512];
+
+size_t dir_len = strlen(dir);
+const char *suffix = "/tmpXXXXXX";
+size_t needed = dir_len + strlen(suffix) + 1;
+
+if (needed > sizeof(temp_path)) {
+    free(full);
     return -1;
+}
+
+memcpy(temp_path, dir, dir_len);
+memcpy(temp_path + dir_len, suffix, strlen(suffix) + 1);
+
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    ssize_t written = write(fd, full, total_len);
+    if (written != (ssize_t)total_len) {
+        close(fd);
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    if (fsync(fd) < 0) {
+        close(fd);
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    close(fd);
+
+    if (rename(temp_path, path) < 0) {
+        unlink(temp_path);
+        free(full);
+        return -1;
+    }
+
+    int dfd = open(dir, O_DIRECTORY);
+    if (dfd >= 0) {
+        fsync(dfd);
+        close(dfd);
+    }
+
+    free(full);
+    return 0;
 }
 
 // Read an object from the store.
@@ -123,6 +211,87 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
     // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    long fsize = ftell(f);
+    if (fsize < 0) {
+        fclose(f);
+        return -1;
+    }
+    rewind(f);
+
+    char *buf = malloc(fsize);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(buf, 1, fsize, f) != (size_t)fsize) {
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+
+    // 3. Parse header
+    void *nul = memchr(buf, '\0', fsize);
+    if (!nul) {
+        free(buf);
+        return -1;
+    }
+
+    char type_str[10];
+    size_t size;
+
+    if (sscanf(buf, "%9s %zu", type_str, &size) != 2) {
+        free(buf);
+        return -1;
+    }
+
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else if (strcmp(type_str, "commit") == 0) *type_out = OBJ_COMMIT;
+    else {
+        free(buf);
+        return -1;
+    }
+
+    ObjectID computed;
+    compute_hash(buf, fsize, &computed);
+
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    char *data_start = (char *)nul + 1;
+
+    if ((size_t)(fsize - (data_start - buf)) < size) {
+        free(buf);
+        return -1;
+    }
+
+    void *out = malloc(size);
+    if (!out) {
+        free(buf);
+        return -1;
+    }
+
+    memcpy(out, data_start, size);
+
+    *data_out = out;
+    *len_out = size;
+
+    free(buf);
+    return 0;
 }
